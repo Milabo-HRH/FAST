@@ -14,6 +14,9 @@
 #include <utility>
 #include <regex>
 
+#define QUERIES_PER_TRIAL (50 * 1000 * 1000)
+#define NUM_OF_BLOCKS 1024
+
 const unsigned K=3;
 
 struct LeafEntry {
@@ -38,7 +41,11 @@ inline unsigned median(unsigned i,unsigned j) {
 }
 
 
-__global__ void searchKernel(const int32_t* v, int32_t key_q, unsigned long long int *result, unsigned scale) {
+__global__ void searchKernel(const int32_t* v, const int32_t* keys,  int *result, unsigned scale, unsigned index) {
+    unsigned key_i = blockIdx.x+NUM_OF_BLOCKS*index;
+    if (key_i>=QUERIES_PER_TRIAL)
+        return;
+    int key_q = keys[key_i];
     const unsigned commonAncesterArray[] = {16,16,16,16,16,16,16,3,1,4,0,5,2,6,16};
     unsigned simd_lane = threadIdx.x;
     unsigned const ancestor = commonAncesterArray[simd_lane];
@@ -93,8 +100,8 @@ __global__ void searchKernel(const int32_t* v, int32_t key_q, unsigned long long
                 child_index = shared_gt[commonAncesterArray[threadIdx.x]]+simd_lane*2-13;
                 if (j==2) {
                     levelOffset = levelOffset * 16 + child_index;
-                    unsigned long long int res = ((pos << 4) | levelOffset);
-                    atomicAdd(result, res);
+                    int res = ((pos << 4) | levelOffset);
+                    result[key_i] = res;
                 }
             }
         }
@@ -104,20 +111,24 @@ __global__ void searchKernel(const int32_t* v, int32_t key_q, unsigned long long
 
 }
 
-unsigned long long int cudaSearch(std::vector<int>& queries, const int32_t* fast, unsigned scale) {
-    const int numStreams = 6480;
-    unsigned long long int * check;
-    cudaMalloc(reinterpret_cast<void **>(&check), sizeof(unsigned long long int));
+void cudaSearch(std::vector<int>& queries, const int32_t* fast, unsigned scale, int* res) {
+    int* deviceData;
+    int sizeInByte = queries.size()*sizeof(int);
+    cudaMalloc(&deviceData, sizeInByte);
+    cudaMemcpy(deviceData, queries.data(), sizeInByte, cudaMemcpyHostToDevice);
+    const int numStreams = 648;
+    int * check;
+    cudaMalloc(&check, sizeInByte);
 
     cudaStream_t streams[numStreams];
     for(int i=0;i<numStreams;++i) {
         cudaStreamCreate(&streams[i]);
     }
 
-    for(size_t i=0;i<queries.size();++i) {
+    for(size_t i=0;i<queries.size()/NUM_OF_BLOCKS;++i) {
         int streamIndex = i % numStreams;
         int key = queries[i];
-        searchKernel<<<1, 15, 0, streams[streamIndex]>>>(fast, key, check, scale);
+        searchKernel<<<NUM_OF_BLOCKS, 15, 0, streams[streamIndex]>>>(fast, deviceData, check, scale, i);
     }
 
     for (int i = 0; i < numStreams; ++i) {
@@ -125,8 +136,12 @@ unsigned long long int cudaSearch(std::vector<int>& queries, const int32_t* fast
 //        cudaStreamDestroy(streams[i]);
     }
 
-    uint64_t hostCheck = 0;
-    cudaMemcpy(&hostCheck, check, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+//    uint64_t hostCheck = 0;
+    cudaMemcpy(res, check, sizeInByte, cudaMemcpyDeviceToHost);
+
+//    for (int i=0;i<queries.size();++i) {
+//        hostCheck += check[i];
+//    }
 
     for (int i = 0; i < numStreams; ++i) {
 //        cudaStreamSynchronize(streams[i]);
@@ -134,7 +149,7 @@ unsigned long long int cudaSearch(std::vector<int>& queries, const int32_t* fast
     }
 
     cudaFree(check);
-    return hostCheck;
+    cudaFree(deviceData);
 }
 
 

@@ -2,7 +2,7 @@
   Fast Architecture Sensitive Tree layout for binary search trees
   (Kim et. al, SIGMOD 2010)
 
-  implementation by Viktor Leis, TUM, 2012
+  implementation by Ruihuan He, UofT, 2024
 
   notes:
   -keys are 4 byte integers
@@ -231,7 +231,7 @@ std::vector<int> read_data(const char *path) {
 
 extern int32_t * pinCuda(int32_t *fast, unsigned n);
 
-extern uint64_t cudaSearch(std::vector<int>& queries, const int32_t* fast, unsigned scale);
+extern uint64_t cudaSearch(std::vector<int>& queries, const int32_t* fast, unsigned scale, int* res);
 
 int main(int argc,char** argv) {
     if (argc < 2) {
@@ -281,16 +281,21 @@ int main(int argc,char** argv) {
     for (int &query : queries) {
         query = keys_clone[dist(rng)];
     }
-
+    int* checks = new int[QUERIES_PER_TRIAL];
     unsigned long long int check = 0;
     auto start = clock();
 //    for (const int& key : queries) {
 //        check += search(fast, key);
 //    }
-    check = cudaSearch(queries, cudaMem, scale);
+    cudaSearch(queries, cudaMem, scale, checks);
     auto end = clock();
+    for(int i=0;i<QUERIES_PER_TRIAL;++i) {
+        check += checks[i];
+    }
     printf("FAST average time taken: %lf ns\n",
            double(end - start) / CLOCKS_PER_SEC / queries.size() * 1e9);
     printf("FAST checksum (can be different from other range search baselines) = %ld\n", check);
+
+    delete[] checks;
     return 0;
 }
