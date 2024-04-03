@@ -47,26 +47,81 @@ inline unsigned pow16(unsigned exponent) {
     return 1<<(exponent<<2);
 }
 
+inline unsigned pow64(unsigned exponent) {
+    // 64^exponent
+    // Since 64 is 2^6, we can left shift 6 times per exponent
+    return 1 << (exponent * 6); // equivalent to exponent<<6
+}
+
 inline unsigned median(unsigned i,unsigned j) {
     return i+(j-1-i)/2;
 }
 
-inline void storeSIMDblock(int32_t v[],unsigned k,LeafEntry l[],unsigned i,unsigned j) {
-    unsigned m=median(i,j);
-    v[k+0]=l[m].key;
-    v[k+1]=l[median(i,m)].key;
-    v[k+2]=l[median(1+m,j)].key;
+
+inline void storeCudaBlock(int32_t v[], unsigned k, LeafEntry l[], unsigned i, unsigned j) {
+    // calculate the 15 keys we need to do the comparison for a 4-level binary tree
+    unsigned m1 = median(i, j);
+    unsigned m2 = median(i, m1);
+    unsigned m3 = median(m1 + 1, j);
+    unsigned m4 = median(i, m2);
+    unsigned m5 = median(m2 + 1, m1);
+    unsigned m6 = median(m1 + 1, m3);
+    unsigned m7 = median(m3 + 1, j);
+    unsigned m8 = median(i, m4);
+    unsigned m9 = median(m4 + 1, m2);
+    unsigned m10 = median(m2 + 1, m5);
+    unsigned m11 = median(m5 + 1, m1);
+    unsigned m12 = median(m1 + 1, m6);
+    unsigned m13 = median(m6 + 1, m3);
+    unsigned m14 = median(m3 + 1, m7);
+    unsigned m15 = median(m7 + 1, j);
+
+    // store them
+    v[k + 0] = l[m1].key;
+    v[k + 1] = l[m2].key;
+    v[k + 2] = l[m3].key;
+    v[k + 3] = l[m4].key;
+    v[k + 4] = l[m5].key;
+    v[k + 5] = l[m6].key;
+    v[k + 6] = l[m7].key;
+    v[k + 7] = l[m8].key;
+    v[k + 8] = l[m9].key;
+    v[k + 9] = l[m10].key;
+    v[k + 10] = l[m11].key;
+    v[k + 11] = l[m12].key;
+    v[k + 12] = l[m13].key;
+    v[k + 13] = l[m14].key;
+    v[k + 14] = l[m15].key;
+}
+//inline void storeCudaBlock(int32_t v[], unsigned k, LeafEntry l[], unsigned i, unsigned j) {
+//    // calculate the 7 keys we need to do the comparison
+//    unsigned m1 = median(i, j);
+//    unsigned m2 = median(i, m1);
+//    unsigned m3 = median(m1 + 1, j);
+//    unsigned m4 = median(i, m2);
+//    unsigned m5 = median(m2 + 1, m1);
+//    unsigned m6 = median(m1 + 1, m3);
+//    unsigned m7 = median(m3 + 1, j);
+//
+//    // store them
+//    v[k + 0] = l[m1].key;
+//    v[k + 1] = l[m2].key;
+//    v[k + 2] = l[m3].key;
+//    v[k + 3] = l[m4].key;
+//    v[k + 4] = l[m5].key;
+//    v[k + 5] = l[m6].key;
+//    v[k + 6] = l[m7].key;
+//}
+
+inline unsigned storeCachelineBlock(int32_t v[], unsigned k, LeafEntry l[], unsigned i, unsigned j) {
+    // Store the root node in the first SIMD block
+    storeCudaBlock(v, k, l, i, j);
+    k += 16;
+
+    // Return the updated offset, now pointing past the blocks for the second level
+    return k;  // The offset is adjusted for the 9 SIMD blocks stored (1 root + 8 children)
 }
 
-inline unsigned storeCachelineBlock(int32_t v[],unsigned k,LeafEntry l[],unsigned i,unsigned j) {
-    storeSIMDblock(v,k+3*0,l,i,j);
-    unsigned m=median(i,j);
-    storeSIMDblock(v,k+3*1,l,i,median(i,m));
-    storeSIMDblock(v,k+3*2,l,median(i,m)+1,m);
-    storeSIMDblock(v,k+3*3,l,m+1,median(m+1,j));
-    storeSIMDblock(v,k+3*4,l,median(m+1,j)+1,j);
-    return k+16;
-}
 
 unsigned storeFASTpage(int32_t v[],unsigned offset,LeafEntry l[],unsigned i,unsigned j,unsigned levels) {
     for (unsigned level=0;level<levels;level++) {
@@ -82,12 +137,13 @@ int32_t* buildFAST(LeafEntry l[],unsigned len) {
     unsigned n=0;
     for (unsigned i=0; i<K+4; i++)
         n+=pow16(i);
-    n=n*64/4;
+    n*=16;
     int32_t* v=(int32_t*)malloc_huge(sizeof(int32_t)*n);
 
     // build FAST
+
     unsigned offset=storeFASTpage(v,0,l,0,len,4);
-    unsigned chunk=len/(1<<16);
+    unsigned chunk = len/(1<<16);
     for (unsigned i=0;i<(1<<16);i++)
         offset=storeFASTpage(v,offset,l,i*chunk,(i+1)*chunk,K);
     assert(offset==n);
@@ -173,6 +229,9 @@ std::vector<int> read_data(const char *path) {
 
 #define QUERIES_PER_TRIAL (50 * 1000 * 1000)
 
+extern int32_t * pinCuda(int32_t *fast, unsigned n);
+
+extern uint64_t cudaSearch(std::vector<int>& queries, const int32_t* fast, unsigned scale);
 
 int main(int argc,char** argv) {
     if (argc < 2) {
@@ -201,7 +260,13 @@ int main(int argc,char** argv) {
 
     int32_t *fast = buildFAST(leaves, n);
     auto build_end = clock();
+
     printf("FAST build time taken: %lf ns\n",
+           double(build_end - build_start) / CLOCKS_PER_SEC * 1e9);
+    int32_t * cudaMem = pinCuda(fast, n);
+    build_end = clock();
+
+    printf("FAST build time taken: %lf ns (including pinning in cuda memory)\n",
            double(build_end - build_start) / CLOCKS_PER_SEC * 1e9);
     for (unsigned i = 0; i < K; i++)
         scale += pow16(i);
@@ -217,11 +282,12 @@ int main(int argc,char** argv) {
         query = keys_clone[dist(rng)];
     }
 
-    long check = 0;
+    unsigned long long int check = 0;
     auto start = clock();
-    for (const int& key : queries) {
-        check += search(fast, key);
-    }
+//    for (const int& key : queries) {
+//        check += search(fast, key);
+//    }
+    check = cudaSearch(queries, cudaMem, scale);
     auto end = clock();
     printf("FAST average time taken: %lf ns\n",
            double(end - start) / CLOCKS_PER_SEC / queries.size() * 1e9);

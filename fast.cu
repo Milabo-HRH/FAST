@@ -12,6 +12,7 @@
 #include <vector>
 #include <random>
 #include <utility>
+#include <regex>
 
 const unsigned K=3;
 
@@ -37,104 +38,111 @@ inline unsigned median(unsigned i,unsigned j) {
 }
 
 
-//
-//inline void storeSIMDblock(int32_t v[],unsigned k,LeafEntry l[],unsigned i,unsigned j) {
-//    unsigned m=median(i,j);
-//    v[k+0]=l[m].key;
-//    v[k+1]=l[median(i,m)].key;
-//    v[k+2]=l[median(1+m,j)].key;
-//}
-//
-//inline unsigned storeCachelineBlock(int32_t v[],unsigned k,LeafEntry l[],unsigned i,unsigned j) {
-//    storeSIMDblock(v,k+3*0,l,i,j);
-//    unsigned m=median(i,j);
-//    storeSIMDblock(v,k+3*1,l,i,median(i,m));
-//    storeSIMDblock(v,k+3*2,l,median(i,m)+1,m);
-//    storeSIMDblock(v,k+3*3,l,m+1,median(m+1,j));
-//    storeSIMDblock(v,k+3*4,l,median(m+1,j)+1,j);
-//    return k+16;
-//}
-//
-//unsigned storeFASTpage(int32_t v[],unsigned offset,LeafEntry l[],unsigned i,unsigned j,unsigned levels) {
-//    for (unsigned level=0;level<levels;level++) {
-//        unsigned chunk=(j-i)/pow16(level);
-//        for (unsigned cl=0;cl<pow16(level);cl++)
-//            offset=storeCachelineBlock(v,offset,l,i+cl*chunk,i+(cl+1)*chunk);
-//    }
-//    return offset;
-//}
-//
-//int32_t* buildFAST(LeafEntry l[],unsigned len) {
-//    // create array of appropriate size
-//    unsigned n=0;
-//    for (unsigned i=0; i<K+4; i++)
-//        n+=pow16(i);
-//    n=n*64/4;
-//    int32_t* v=(int32_t*)malloc_huge(sizeof(int32_t)*n);
-//
-//    // build FAST
-//    unsigned offset=storeFASTpage(v,0,l,0,len,4);
-//    unsigned chunk=len/(1<<16);
-//    for (unsigned i=0;i<(1<<16);i++)
-//        offset=storeFASTpage(v,offset,l,i*chunk,(i+1)*chunk,K);
-//    assert(offset==n);
-//
-//    return v;
-//}
-//
-__device__ unsigned maskToIndex(unsigned bitmask) {
-    const unsigned table[8] = {0, 9, 1, 2, 9, 9, 9, 3};
-    return table[bitmask & 7];
-}
+__global__ void searchKernel(const int32_t* v, int32_t key_q, unsigned long long int *result, unsigned scale) {
+    const unsigned commonAncesterArray[] = {16,16,16,16,16,16,16,3,1,4,0,5,2,6,16};
+    unsigned simd_lane = threadIdx.x;
+    unsigned const ancestor = commonAncesterArray[simd_lane];
+    __shared__ int child_index;
+    __shared__ int shared_gt[16];
+    unsigned levelOffset = 0;
+    for (int i=0;i<4;++i) {
+        size_t addr = ((1 << (4 * i)) - 1) + levelOffset * 16;
 
-unsigned scale=0;
+//        printf("Thread %d is running\n", idx);
+        int32_t v_node = *(v+addr+simd_lane);
+//        printf("Thread %d is running after v\n", idx);
+        int32_t gt = (key_q>v_node);
+        shared_gt[simd_lane] = gt;
+//        printf("Thread %d is running after v\n", idx);
+        __syncthreads();
 
-unsigned search(int32_t v[],int32_t key_q) {
-    __m128i xmm_key_q=_mm_set1_epi32(key_q);
-
-    unsigned page_offset=0;
-    unsigned level_offset=0;
-
-    // first page
-    for (unsigned cl_level=1; cl_level<=4; cl_level++) {
-        // first SIMD block
-        __m128i xmm_tree=_mm_loadu_si128((__m128i*) (v+page_offset+level_offset*16));
-        __m128i xmm_mask=_mm_cmpgt_epi32(xmm_key_q,xmm_tree);
-        unsigned index=_mm_movemask_ps(_mm_castsi128_ps(xmm_mask));
-        unsigned child_index=maskToIndex(index);
-
-        // second SIMD block
-        xmm_tree=_mm_loadu_si128((__m128i*) (v+page_offset+level_offset*16+3+3*child_index));
-        xmm_mask=_mm_cmpgt_epi32(xmm_key_q,xmm_tree);
-        index=_mm_movemask_ps(_mm_castsi128_ps(xmm_mask));
-
-        unsigned cache_offset=child_index*4 + maskToIndex(index);
-        level_offset=level_offset*16 + cache_offset;
-        page_offset+=pow16(cl_level);
+        int32_t next_gt = shared_gt[simd_lane+1];
+        if (threadIdx.x == 7) {
+            if(!gt)
+                child_index = 0;
+        }
+        if (threadIdx.x >= 7 && threadIdx.x<14) {
+            if(gt && next_gt==0) {
+                child_index = shared_gt[commonAncesterArray[threadIdx.x]]+simd_lane*2-13;
+            }
+        }
+        __syncthreads();
+        levelOffset = levelOffset * 16 + child_index;
     }
 
-    unsigned pos=level_offset;
-    unsigned offset=69904+level_offset*scale;
-    page_offset=0;
-    level_offset=0;
 
-    // second page
-    for (unsigned cl_level=1; cl_level<=K; cl_level++) {
-        // first SIMD block
-        __m128i xmm_tree=_mm_loadu_si128((__m128i*) (v+offset+page_offset+level_offset*16));
-        __m128i xmm_mask=_mm_cmpgt_epi32(xmm_key_q,xmm_tree);
-        unsigned index=_mm_movemask_ps(_mm_castsi128_ps(xmm_mask));
-        unsigned child_index=maskToIndex(index);
+    unsigned offset = 69904 + levelOffset*scale;
+    unsigned pos = levelOffset;
+    levelOffset = 0;
+    unsigned pageOffset = 0;
 
-        // second SIMD block
-        xmm_tree=_mm_loadu_si128((__m128i*) (v+offset+page_offset+level_offset*16+3+3*child_index));
-        xmm_mask=_mm_cmpgt_epi32(xmm_key_q,xmm_tree);
-        index=_mm_movemask_ps(_mm_castsi128_ps(xmm_mask));
+    for (int j=0;j<3;++j) {
+        size_t addr = offset + (2^(4*j)-1) + levelOffset * 16;
+        int32_t v_node = v[addr+simd_lane];
 
-        unsigned cache_offset=child_index*4 + maskToIndex(index);
-        level_offset=level_offset*16 + cache_offset;
-        page_offset+=pow16(cl_level);
+        int32_t gt = (key_q>v_node);
+        shared_gt[simd_lane] = gt;
+        __syncthreads();
+
+        int32_t next_gt = shared_gt[simd_lane+1];
+        if (threadIdx.x == 7 && !gt) {
+            child_index = 0;
+        }
+        if (threadIdx.x >= 7) {
+            if(gt && !next_gt) {
+                child_index = shared_gt[commonAncesterArray[threadIdx.x]]+simd_lane*2-13;
+                if (j==2) {
+                    levelOffset = levelOffset * 16 + child_index;
+                    unsigned long long int res = ((pos << 4) | levelOffset);
+                    atomicAdd(result, res);
+                }
+            }
+        }
+        __syncthreads();
+        levelOffset = levelOffset * 16 + child_index;
     }
 
-    return (pos<<(K*4))|level_offset;
 }
+
+unsigned long long int cudaSearch(std::vector<int>& queries, const int32_t* fast, unsigned scale) {
+    const int numStreams = 6480;
+    unsigned long long int * check;
+    cudaMalloc(reinterpret_cast<void **>(&check), sizeof(unsigned long long int));
+
+    cudaStream_t streams[numStreams];
+    for(int i=0;i<numStreams;++i) {
+        cudaStreamCreate(&streams[i]);
+    }
+
+    for(size_t i=0;i<queries.size();++i) {
+        int streamIndex = i % numStreams;
+        int key = queries[i];
+        searchKernel<<<1, 15, 0, streams[streamIndex]>>>(fast, key, check, scale);
+    }
+
+    for (int i = 0; i < numStreams; ++i) {
+        cudaStreamSynchronize(streams[i]);
+//        cudaStreamDestroy(streams[i]);
+    }
+
+    uint64_t hostCheck = 0;
+    cudaMemcpy(&hostCheck, check, sizeof(uint64_t), cudaMemcpyDeviceToHost);
+
+    for (int i = 0; i < numStreams; ++i) {
+//        cudaStreamSynchronize(streams[i]);
+        cudaStreamDestroy(streams[i]);
+    }
+
+    cudaFree(check);
+    return hostCheck;
+}
+
+
+
+int32_t * pinCuda(int32_t *fast, unsigned n) {
+    void* add = (malloc_huge_cuda(n*sizeof(int32_t)));
+    cudaMemcpy(add, fast, sizeof(int) * n, cudaMemcpyHostToDevice);
+    return (int32_t *)add;
+}
+
+
