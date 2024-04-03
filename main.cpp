@@ -12,7 +12,8 @@
   -cacheline blocks store 15 keys and are 64-byte aligned
   -the parameter K results in a tree size of (2^(16+K*4))
  */
-
+#include <boost/asio.hpp>
+#include <boost/bind/bind.hpp>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <sys/time.h>
@@ -26,6 +27,8 @@
 #include <vector>
 #include <random>
 #include <utility>
+#include <atomic>
+#include <thread>
 
 const unsigned K=3;
 
@@ -57,6 +60,49 @@ inline unsigned median(unsigned i,unsigned j) {
     return i+(j-1-i)/2;
 }
 
+inline void storeSIMDblock(int32_t v[],unsigned k,LeafEntry l[],unsigned i,unsigned j) {
+    unsigned m=median(i,j);
+    v[k+0]=l[m].key;
+    v[k+1]=l[median(i,m)].key;
+    v[k+2]=l[median(1+m,j)].key;
+}
+
+inline unsigned storeCachelineBlock(int32_t v[],unsigned k,LeafEntry l[],unsigned i,unsigned j) {
+    storeSIMDblock(v,k+3*0,l,i,j);
+    unsigned m=median(i,j);
+    storeSIMDblock(v,k+3*1,l,i,median(i,m));
+    storeSIMDblock(v,k+3*2,l,median(i,m)+1,m);
+    storeSIMDblock(v,k+3*3,l,m+1,median(m+1,j));
+    storeSIMDblock(v,k+3*4,l,median(m+1,j)+1,j);
+    return k+16;
+}
+
+unsigned storeFASTpage(int32_t v[],unsigned offset,LeafEntry l[],unsigned i,unsigned j,unsigned levels) {
+    for (unsigned level=0;level<levels;level++) {
+        unsigned chunk=(j-i)/pow16(level);
+        for (unsigned cl=0;cl<pow16(level);cl++)
+            offset=storeCachelineBlock(v,offset,l,i+cl*chunk,i+(cl+1)*chunk);
+    }
+    return offset;
+}
+
+int32_t* buildFAST(LeafEntry l[],unsigned len) {
+    // create array of appropriate size
+    unsigned n=0;
+    for (unsigned i=0; i<K+4; i++)
+        n+=pow16(i);
+    n=n*64/4;
+    int32_t* v=(int32_t*)malloc_huge(sizeof(int32_t)*n);
+
+    // build FAST
+    unsigned offset=storeFASTpage(v,0,l,0,len,4);
+    unsigned chunk=len/(1<<16);
+    for (unsigned i=0;i<(1<<16);i++)
+        offset=storeFASTpage(v,offset,l,i*chunk,(i+1)*chunk,K);
+    assert(offset==n);
+
+    return v;
+}
 
 inline void storeCudaBlock(int32_t v[], unsigned k, LeafEntry l[], unsigned i, unsigned j) {
     // calculate the 15 keys we need to do the comparison for a 4-level binary tree
@@ -113,7 +159,7 @@ inline void storeCudaBlock(int32_t v[], unsigned k, LeafEntry l[], unsigned i, u
 //    v[k + 6] = l[m7].key;
 //}
 
-inline unsigned storeCachelineBlock(int32_t v[], unsigned k, LeafEntry l[], unsigned i, unsigned j) {
+inline unsigned storeCachelineBlockCuda(int32_t v[], unsigned k, LeafEntry l[], unsigned i, unsigned j) {
     // Store the root node in the first SIMD block
     storeCudaBlock(v, k, l, i, j);
     k += 16;
@@ -123,16 +169,16 @@ inline unsigned storeCachelineBlock(int32_t v[], unsigned k, LeafEntry l[], unsi
 }
 
 
-unsigned storeFASTpage(int32_t v[],unsigned offset,LeafEntry l[],unsigned i,unsigned j,unsigned levels) {
+unsigned storeCudaFastPage(int32_t v[], unsigned offset, LeafEntry l[], unsigned i, unsigned j, unsigned levels) {
     for (unsigned level=0;level<levels;level++) {
         unsigned chunk=(j-i)/pow16(level);
         for (unsigned cl=0;cl<pow16(level);cl++)
-            offset=storeCachelineBlock(v,offset,l,i+cl*chunk,i+(cl+1)*chunk);
+            offset= storeCachelineBlockCuda(v, offset, l, i + cl * chunk, i + (cl + 1) * chunk);
     }
     return offset;
 }
 
-int32_t* buildFAST(LeafEntry l[],unsigned len) {
+int32_t* buildFASTCuda(LeafEntry l[], unsigned len) {
     // create array of appropriate size
     unsigned n=0;
     for (unsigned i=0; i<K+4; i++)
@@ -142,10 +188,10 @@ int32_t* buildFAST(LeafEntry l[],unsigned len) {
 
     // build FAST
 
-    unsigned offset=storeFASTpage(v,0,l,0,len,4);
+    unsigned offset= storeCudaFastPage(v, 0, l, 0, len, 4);
     unsigned chunk = len/(1<<16);
     for (unsigned i=0;i<(1<<16);i++)
-        offset=storeFASTpage(v,offset,l,i*chunk,(i+1)*chunk,K);
+        offset= storeCudaFastPage(v, offset, l, i * chunk, (i + 1) * chunk, K);
     assert(offset==n);
 
     return v;
@@ -158,7 +204,7 @@ inline unsigned maskToIndex(unsigned bitmask) {
 
 unsigned scale=0;
 
-unsigned search(int32_t v[],int32_t key_q) {
+unsigned search(const int32_t v[],int32_t key_q) {
     __m128i xmm_key_q=_mm_set1_epi32(key_q);
 
     unsigned page_offset=0;
@@ -211,6 +257,8 @@ unsigned search(int32_t v[],int32_t key_q) {
 
 #define BUF_SIZE 2048
 
+#define THREAD_NUM 8
+
 std::vector<int> read_data(const char *path) {
     std::vector<int> vec;
     FILE *fin = fopen(path, "rb");
@@ -225,9 +273,32 @@ std::vector<int> read_data(const char *path) {
     fclose(fin);
     return vec;
 }
-
-
 #define QUERIES_PER_TRIAL (50 * 1000 * 1000)
+
+std::atomic<unsigned long long> check_atomic(0);  // 使用原子变量以避免并发问题
+
+void threadedSearch(const int32_t* v, const std::vector<int>& queries, unsigned i) {
+    for(int j=0;j<QUERIES_PER_TRIAL/THREAD_NUM;++j) {
+        int k = j + i*((QUERIES_PER_TRIAL+THREAD_NUM-1)/THREAD_NUM);
+        if (k>=QUERIES_PER_TRIAL)
+            return;
+        unsigned result = search(v, queries[k]);
+        check_atomic += result;
+    }
+     // 安全地更新全局计数
+}
+
+void parallelSearch(const int32_t* v, const std::vector<int>& queries, unsigned scale) {
+    boost::asio::thread_pool pool(THREAD_NUM);
+
+    for (int i=0; i<THREAD_NUM;++i) {
+        boost::asio::post(pool, boost::bind(threadedSearch, v, queries, i));
+    }
+
+    pool.join();  // 等待所有任务完成
+}
+
+
 
 extern int32_t * pinCuda(int32_t *fast, unsigned n);
 
@@ -258,12 +329,11 @@ int main(int argc,char** argv) {
         leaves[i].value = i;
     }
 
-    int32_t *fast = buildFAST(leaves, n);
+    int32_t *fastCuda = buildFASTCuda(leaves, n);
     auto build_end = clock();
-
     printf("FAST build time taken: %lf ns\n",
            double(build_end - build_start) / CLOCKS_PER_SEC * 1e9);
-    int32_t * cudaMem = pinCuda(fast, n);
+    int32_t * cudaMem = pinCuda(fastCuda, n);
     build_end = clock();
 
     printf("FAST build time taken: %lf ns (including pinning in cuda memory)\n",
@@ -285,7 +355,7 @@ int main(int argc,char** argv) {
     unsigned long long int check = 0;
     auto start = clock();
 //    for (const int& key : queries) {
-//        check += search(fast, key);
+//        check += search(fastCuda, key);
 //    }
     cudaSearch(queries, cudaMem, scale, checks);
     auto end = clock();
@@ -297,5 +367,15 @@ int main(int argc,char** argv) {
     printf("FAST checksum (can be different from other range search baselines) = %ld\n", check);
 
     delete[] checks;
+
+    int32_t *fast = buildFAST(leaves, n);
+//    check = 0;
+    start = clock();
+    parallelSearch(fast, queries, scale);
+    end = clock();
+    printf("FAST average time taken: %lf ns\n",
+           double(end - start) / CLOCKS_PER_SEC / queries.size() * 1e9);
+    printf("FAST checksum (can be different from other range search baselines) = %llu\n", check_atomic.load());
+
     return 0;
 }

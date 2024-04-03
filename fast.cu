@@ -100,7 +100,7 @@ __global__ void searchKernel(const int32_t* v, const int32_t* keys,  int *result
                 child_index = shared_gt[commonAncesterArray[threadIdx.x]]+simd_lane*2-13;
                 if (j==2) {
                     levelOffset = levelOffset * 16 + child_index;
-                    int res = ((pos << 4) | levelOffset);
+                    int res = ((pos << (4*3)) | levelOffset);
                     result[key_i] = res;
                 }
             }
