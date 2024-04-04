@@ -285,7 +285,7 @@ void threadedSearch(const int32_t* v, const std::vector<int>& queries, unsigned 
         unsigned result = search(v, queries[k]);
         check_atomic += result;
     }
-     // 安全地更新全局计数
+    // 安全地更新全局计数
 }
 
 void parallelSearch(const int32_t* v, const std::vector<int>& queries, unsigned scale) {
