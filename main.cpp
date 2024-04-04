@@ -29,6 +29,7 @@
 #include <utility>
 #include <atomic>
 #include <thread>
+#include <chrono>
 
 const unsigned K=3;
 
@@ -257,7 +258,7 @@ unsigned search(const int32_t v[],int32_t key_q) {
 
 #define BUF_SIZE 2048
 
-#define THREAD_NUM 8
+#define THREAD_NUM 256
 
 std::vector<int> read_data(const char *path) {
     std::vector<int> vec;
@@ -290,12 +291,16 @@ void threadedSearch(const int32_t* v, const std::vector<int>& queries, unsigned 
 
 void parallelSearch(const int32_t* v, const std::vector<int>& queries, unsigned scale) {
     boost::asio::thread_pool pool(THREAD_NUM);
-
+    std::vector<std::thread> threads;
     for (int i=0; i<THREAD_NUM;++i) {
-        boost::asio::post(pool, boost::bind(threadedSearch, v, queries, i));
+        threads.emplace_back(threadedSearch, v, queries, i);
     }
 
-    pool.join();  // 等待所有任务完成
+    for (auto& th : threads) {
+        if (th.joinable()) {
+            th.join();
+        }
+    }
 }
 
 
@@ -353,28 +358,31 @@ int main(int argc,char** argv) {
     }
     int* checks = new int[QUERIES_PER_TRIAL];
     unsigned long long int check = 0;
-    auto start = clock();
+    auto start = std::chrono::high_resolution_clock::now();
 //    for (const int& key : queries) {
 //        check += search(fastCuda, key);
 //    }
     cudaSearch(queries, cudaMem, scale, checks);
-    auto end = clock();
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::nano> elapsed_cuda = end - start;
     for(int i=0;i<QUERIES_PER_TRIAL;++i) {
         check += checks[i];
     }
     printf("FAST average time taken: %lf ns\n",
-           double(end - start) / CLOCKS_PER_SEC / queries.size() * 1e9);
+           elapsed_cuda/ queries.size() );
     printf("FAST checksum (can be different from other range search baselines) = %ld\n", check);
 
     delete[] checks;
 
     int32_t *fast = buildFAST(leaves, n);
 //    check = 0;
-    start = clock();
+    auto start_multi = std::chrono::high_resolution_clock::now();
     parallelSearch(fast, queries, scale);
-    end = clock();
+    auto end_multi = std::chrono::high_resolution_clock::now();
+
+    std::chrono::duration<double, std::nano> elapsed = end_multi - start_multi;
     printf("FAST average time taken: %lf ns\n",
-           double(end - start) / CLOCKS_PER_SEC / queries.size() * 1e9);
+           elapsed.count()/queries.size());
     printf("FAST checksum (can be different from other range search baselines) = %llu\n", check_atomic.load());
 
     return 0;
