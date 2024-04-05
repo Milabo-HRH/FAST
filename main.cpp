@@ -288,7 +288,7 @@ void threadedSearch(const int32_t* v, const std::vector<int>& queries, unsigned 
 }
 
 void parallelSearch(const int32_t* v, const std::vector<int>& queries, unsigned scale) {
-    boost::asio::thread_pool pool(THREAD_NUM);
+//    boost::asio::thread_pool pool(THREAD_NUM);
     std::vector<std::thread> threads;
     for (int i=0; i<THREAD_NUM;++i) {
         threads.emplace_back(threadedSearch, v, queries, i);
