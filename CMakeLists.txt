@@ -8,7 +8,7 @@ set(CMAKE_CUDA_ARCHITECTURES 75)
 set(CMAKE_GENERATOR_PLATFORM x64)
 
 # Find Boost package, specifically looking for the Asio component
-find_package(Boost REQUIRED COMPONENTS system)
+#find_package(Boost REQUIRED COMPONENTS system)
 
 set(SOURCE_FILES main.cpp FAST.cu)
 
@@ -23,7 +23,7 @@ target_compile_options(FAST PRIVATE
 )
 
 # Link Boost libraries to the FAST target
-target_link_libraries(FAST PRIVATE Boost::system)
+#target_link_libraries(FAST PRIVATE Boost::system)
 
 # Optional: Enable separate compilation for CUDA code
 set_target_properties(FAST PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

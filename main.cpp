@@ -12,8 +12,6 @@
   -cacheline blocks store 15 keys and are 64-byte aligned
   -the parameter K results in a tree size of (2^(16+K*4))
  */
-#include <boost/asio.hpp>
-#include <boost/bind/bind.hpp>
 #include <sys/mman.h>
 #include <stdlib.h>
 #include <sys/time.h>
