@@ -10,7 +10,7 @@ set(CMAKE_GENERATOR_PLATFORM x64)
 # Find Boost package, specifically looking for the Asio component
 #find_package(Boost REQUIRED COMPONENTS system)
 
-set(SOURCE_FILES main.cpp FAST.cu)
+set(SOURCE_FILES main.cpp fast.cu)
 
 add_executable(FAST ${SOURCE_FILES})
 
